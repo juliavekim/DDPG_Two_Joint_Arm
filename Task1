@@ -1,0 +1,145 @@
+% Deep deterministic policy gradient, in a case where the discount 
+% factor gamma = 1 
+
+clear variables;
+clc;
+clf; 
+
+global n_q q_min q_max psi Dt n_steps r 
+
+% Set up state dynamics
+psi = [2.00; 0.63; 0.52]; 
+q_min = [-2; 0];
+q_max = [1.5; 2.5]; 
+n_q = 2; 
+n_s = 2*n_q; 
+n_a = n_q; 
+
+% Define task 
+s_star = [0; 0.5; 0; 0]; 
+r = @(s, a) -10*(s-s_star)'*(s-s_star) - 0.01*a'*a; 
+n_steps = 30;  
+Dt = 0.1; % in seconds 
+
+% Set up learning 
+a_sd = 0.1; % standard deviation of stochastic policy
+eta_Q = 1e-3;
+eta_mu = 1e-6;
+tau = 3e-4;
+adam_1 = 0.9;
+adam_2 = 0.999;
+n_rollouts = 1000;
+n_m = 100;
+n_buf = 1000000;
+buf_fill = 0;
+buf_i = 0;
+BUFFER = zeros(2*n_s + n_a + 1, n_buf); 
+
+% Set initial state for test
+s_test = [-1; 1; 0; 0]; 
+
+% Set random-number generator
+rng(15); 
+
+% Create nets
+mu = create_net([n_s; 100; 100; n_a], 0.5*[0; 1; 1; 1], "relu");
+Q_est = create_net([n_s + n_a; 20; 20; 1], 0.5*[0; 1; 1; 1], "relu"); 
+Q_tgt = Q_est; 
+
+% Assess initial policy
+G = test_policy(mu, s_test); 
+fprintf('At rollout 0, G = %.3f\n', G); 
+
+% Train policy
+for rollout = 1:n_rollouts
+  % Run rollout
+  % Initialise random state, where joint angles are within their bounds 
+  % and joint velocities are set to 0.
+  s = [q_max - q_min; 0; 0].*rand(n_s, 1) + [q_min; 0; 0]; 
+  for t = 0:Dt:n_steps*Dt
+    % Compute transition
+    mu = forward(mu, s);
+    a = mu.y{end} + a_sd*randn(n_a, 1);
+    s_next = state_dynamics(s, a);
+
+    % Store in the buffer
+    BUFFER(:, buf_i + 1) = [s; a; r(s, a); s_next];
+    buf_i = mod(buf_i + 1, n_buf);
+    buf_fill = min(buf_fill + 1, n_buf);
+
+    % Choose a minibatch from the buffer
+    i = ceil(buf_fill*rand(1, n_m)); % round up, rather than round down
+    s_ = BUFFER(1:n_s, i); % draw data out of the buffer; s_, a_ is to distinguish from s, a, r 
+    a_ = BUFFER(n_s + 1:n_s + n_a, i);
+    r_ = BUFFER(n_s + n_a + 1:n_s + n_a + 1, i);
+    s_next_ = BUFFER(n_s + n_a + 2:end, i);
+    
+    % Adjust critic (i.e. Q_est) to minimise the squared Bellman error over the buffer-minibatch
+    Q_est = forward(Q_est, [s_; a_]);
+    mu = forward(mu, s_next_);
+    a_next_ = mu.y{end} + a_sd*randn(n_a, 1); 
+    Q_tgt = forward(Q_tgt, [s_next_; a_next_]);
+    Q_e = Q_est.y{end} - (Dt*r_ + Q_tgt.y{end});
+    Q_est = backprop(Q_est, Q_e); 
+    Q_est = adam(Q_est, Q_est.dL_dW, Q_est.dL_db, eta_Q, adam_1, adam_2); 
+        
+    % Adjust actor (i.e. policy, mu) to maximise Q over buffer-minibatch
+    mu = forward(mu, s_);
+    a__ = mu.y{end};
+    Q_est = forward(Q_est, [s_; a__]);
+    dQ = d_dx(Q_est, ones(1, n_m));
+    dQ_da = dQ(n_s + 1:end, :);
+    mu = backprop(mu, -dQ_da);
+    mu = adam(mu, mu.dL_dW, mu.dL_db, eta_mu, adam_1, adam_2);
+               
+    % Nudge target net toward learning one
+    for l = 2:Q_est.n_layers
+      Q_tgt.W{l} = Q_tgt.W{l} + tau*(Q_est.W{l} - Q_tgt.W{l});
+      Q_tgt.b{l} = Q_tgt.b{l} + tau*(Q_est.b{l} - Q_tgt.b{l});
+    end
+        
+    % Update s
+    s = s_next;
+
+  end  % for t
+  
+  % Test policy
+  if mod(rollout, 100) == 0
+    Q_nse = batch_nse(Dt*r_ + Q_tgt.y{end}, Q_e);
+    G = test_policy(mu, s_test);  
+    fprintf('At rollout %d, G = %.3f, Q_nse = %.4f\n', rollout, G, Q_nse)
+  end
+
+end  % for rollout
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+function f = state_dynamics(s, a)
+  global psi q_min q_max Dt 
+  
+  q = s(1:2, :);
+  q_vel = s(3:4, :); 
+
+  % Define state dynamics matrices 
+  M = [psi(1)+2*psi(2)*cos(q(2)), psi(3)+psi(2)*cos(q(2)); psi(3) + ...
+        psi(2)*cos(q(2)), psi(3)]; 
+  GAMMA = psi(2)*sin(q(2))*[-q_vel(2), -(q_vel(1)+q_vel(2)); q_vel(1), 0];
+
+  q_acc = inv(M)*(a-GAMMA*q_vel); % state dynamics 
+  q = q + Dt*q_vel; % Euler integration 
+  q_vel = q_vel + Dt*q_acc; % " 
+  q_bounded = max(q_min, min(q_max, q)); % bound joints w/in motion ranges 
+  q_vel = q_vel - q_vel.*((q == q_max).*(q_vel>0)) + (q==q_min).*(q_vel < 0);
+  q = q_bounded;
+  f = [q; q_vel]; 
+end % function state_dynamics 
+
+function G = test_policy(mu, s) 
+  global Dt n_steps r 
+  G = 0;
+  for t = 0:Dt:n_steps*Dt
+      mu = forward(mu, s); % set noise to zero for test 
+      a = mu.y{end}; 
+      G = G + Dt*r(s, a);
+      s = state_dynamics(s, a);
+  end  % for t
+end % function test_policy 
